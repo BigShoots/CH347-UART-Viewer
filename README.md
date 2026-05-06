@@ -2,7 +2,7 @@
 
 A small Windows UART viewer/logger for WCH CH347 adapters and other serial COM ports.
 
-It is intentionally simple: pick a port, choose serial settings, connect, watch incoming UART text, and keep a raw byte log on disk.
+It is intentionally simple: pick a port, choose serial settings, connect, watch incoming UART text, and keep a cleaned text log on disk.
 
 ## Features
 
@@ -11,7 +11,10 @@ It is intentionally simple: pick a port, choose serial settings, connect, watch 
 - Supports common high-speed UART rates such as `1500000`, `2000000`, and `3000000`.
 - Configurable baud, data bits, parity, stop bits, flow control, DTR, and RTS.
 - Text and hex display modes.
-- Raw log capture to `logs\uart_YYYYMMDD_HHMMSS_COMx_baud.log`.
+- Cleaned text log capture to `logs\uart_YYYYMMDD_HHMMSS_COMx_baud.log`.
+- Optional CR/backspace spinner cleanup for bootloader progress animations.
+- Filter visible lines by substring.
+- Search visible lines by substring with previous/next navigation.
 - Single PowerShell/WinForms script; no build step required.
 
 ## Requirements

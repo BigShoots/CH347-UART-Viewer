@@ -22,6 +22,13 @@ $script:ByteCount = 0L
 $script:DisplayDecoder = New-Object System.Text.UTF8Encoding($false, $false)
 $script:MaxDisplayChars = 1048576
 $script:PollTimer = $null
+$script:DisplayLines = New-Object System.Collections.Generic.List[string]
+$script:DisplayCharCount = 0
+$script:PendingLine = ""
+$script:RenderedLineOffsets = @()
+$script:RenderedLineIndexes = @()
+$script:CurrentSearchRenderedIndex = -1
+$script:LastSearchText = ""
 
 function Get-PortInventory {
     $ports = @{}
@@ -122,26 +129,6 @@ function Get-DefaultLogPath {
     Join-Path $logDir ("uart_{0}_{1}_{2}.log" -f $stamp, $Port, $Baud)
 }
 
-function Add-Line {
-    param([string]$Message)
-
-    $terminal.AppendText(("`r`n[{0}] {1}`r`n" -f (Get-Date -Format "HH:mm:ss"), $Message))
-    if ($autoscrollCheck.Checked) {
-        $terminal.SelectionStart = $terminal.TextLength
-        $terminal.ScrollToCaret()
-    }
-}
-
-function Trim-Terminal {
-    if ($terminal.TextLength -le $script:MaxDisplayChars) {
-        return
-    }
-
-    $remove = $terminal.TextLength - $script:MaxDisplayChars
-    $terminal.Select(0, $remove)
-    $terminal.SelectedText = ""
-}
-
 function Format-BytesForDisplay {
     param([byte[]]$Bytes)
 
@@ -151,6 +138,301 @@ function Format-BytesForDisplay {
 
     $text = $script:DisplayDecoder.GetString($Bytes)
     $text -replace "`0", ""
+}
+
+function Get-FilterText {
+    if ($filterBox) {
+        return $filterBox.Text.Trim()
+    }
+    ""
+}
+
+function Test-LineMatchesFilter {
+    param([string]$Line)
+
+    $filter = Get-FilterText
+    if (-not $filter) {
+        return $true
+    }
+
+    return ($Line.IndexOf($filter, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
+function Test-SuppressLine {
+    param([string]$Line)
+
+    if (-not ($cleanSpinnerCheck -and $cleanSpinnerCheck.Checked)) {
+        return $false
+    }
+
+    $trimmed = $Line.Trim()
+    if (-not $trimmed) {
+        return $true
+    }
+
+    if ($trimmed.Length -le 12 -and $trimmed -match '^[\|/\\\-\.\[\]\(\) ]+$') {
+        return $true
+    }
+
+    return $false
+}
+
+function Trim-DisplayLines {
+    while ($script:DisplayCharCount -gt $script:MaxDisplayChars -and $script:DisplayLines.Count -gt 0) {
+        $script:DisplayCharCount -= ($script:DisplayLines[0].Length + 2)
+        $script:DisplayLines.RemoveAt(0)
+    }
+}
+
+function Write-LogText {
+    param([string]$Text)
+
+    if (-not $script:LogStream) {
+        return
+    }
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $script:LogStream.Write($bytes, 0, $bytes.Length)
+}
+
+function Trim-TerminalText {
+    if ($terminal.TextLength -le $script:MaxDisplayChars) {
+        return
+    }
+
+    $remove = $terminal.TextLength - $script:MaxDisplayChars
+    $terminal.Select(0, $remove)
+    $terminal.SelectedText = ""
+}
+
+function Render-Terminal {
+    param([switch]$KeepSelection)
+
+    if (-not $terminal) {
+        return
+    }
+
+    $selectionStart = $terminal.SelectionStart
+    $selectionLength = $terminal.SelectionLength
+    $wasAtEnd = ($selectionStart -ge [Math]::Max(0, $terminal.TextLength - 1))
+
+    $offsets = New-Object System.Collections.Generic.List[int]
+    $indexes = New-Object System.Collections.Generic.List[int]
+    $builder = New-Object System.Text.StringBuilder
+
+    for ($i = 0; $i -lt $script:DisplayLines.Count; $i++) {
+        $line = $script:DisplayLines[$i]
+        if (Test-LineMatchesFilter -Line $line) {
+            [void]$offsets.Add($builder.Length)
+            [void]$indexes.Add($i)
+            [void]$builder.AppendLine($line)
+        }
+    }
+
+    $script:RenderedLineOffsets = $offsets.ToArray()
+    $script:RenderedLineIndexes = $indexes.ToArray()
+    $terminal.Text = $builder.ToString()
+
+    if ($KeepSelection -and $selectionStart -lt $terminal.TextLength) {
+        $terminal.SelectionStart = $selectionStart
+        $terminal.SelectionLength = [Math]::Min($selectionLength, $terminal.TextLength - $selectionStart)
+    } elseif ($autoscrollCheck.Checked -or $wasAtEnd) {
+        $terminal.SelectionStart = $terminal.TextLength
+        $terminal.ScrollToCaret()
+    }
+
+    Update-SearchStatus
+}
+
+function Add-DisplayLine {
+    param(
+        [string]$Line,
+        [switch]$SkipLog
+    )
+
+    if (Test-SuppressLine -Line $Line) {
+        return
+    }
+
+    [void]$script:DisplayLines.Add($Line)
+    $script:DisplayCharCount += ($Line.Length + 2)
+    Trim-DisplayLines
+
+    if (-not $SkipLog) {
+        Write-LogText ($Line + "`r`n")
+    }
+}
+
+function Add-Line {
+    param([string]$Message)
+
+    Add-DisplayLine -Line ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Message) -SkipLog
+    Render-Terminal
+}
+
+function Add-ReceivedText {
+    param([string]$Text)
+
+    if (-not $Text) {
+        return
+    }
+
+    $linesAdded = 0
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $char = $Text[$i]
+
+        if ($char -eq [char]0) {
+            continue
+        }
+
+        if ($char -eq "`b") {
+            if ($script:PendingLine.Length -gt 0) {
+                $script:PendingLine = $script:PendingLine.Substring(0, $script:PendingLine.Length - 1)
+            }
+            continue
+        }
+
+        if ($char -eq "`r") {
+            if (($i + 1) -lt $Text.Length -and $Text[$i + 1] -eq "`n") {
+                Add-DisplayLine -Line $script:PendingLine
+                $script:PendingLine = ""
+                $linesAdded++
+                $i++
+            } elseif ($cleanSpinnerCheck.Checked) {
+                if (-not (Test-SuppressLine -Line $script:PendingLine)) {
+                    Add-DisplayLine -Line $script:PendingLine
+                    $linesAdded++
+                }
+                $script:PendingLine = ""
+            } else {
+                Add-DisplayLine -Line $script:PendingLine
+                $script:PendingLine = ""
+                $linesAdded++
+            }
+            continue
+        }
+
+        if ($char -eq "`n") {
+            Add-DisplayLine -Line $script:PendingLine
+            $script:PendingLine = ""
+            $linesAdded++
+            continue
+        }
+
+        if ([char]::IsControl($char) -and $char -ne "`t") {
+            continue
+        }
+
+        $script:PendingLine += $char
+    }
+
+    if ($linesAdded -gt 0) {
+        Render-Terminal
+    }
+}
+
+function Flush-PendingLine {
+    if ($script:PendingLine.Length -gt 0) {
+        Add-DisplayLine -Line $script:PendingLine
+        $script:PendingLine = ""
+        Render-Terminal
+    }
+}
+
+function Clear-TerminalBuffer {
+    $script:DisplayLines.Clear()
+    $script:DisplayCharCount = 0
+    $script:PendingLine = ""
+    $script:RenderedLineOffsets = @()
+    $script:RenderedLineIndexes = @()
+    $script:CurrentSearchRenderedIndex = -1
+    $terminal.Clear()
+    Update-SearchStatus
+}
+
+function Update-SearchStatus {
+    if (-not $searchStatusLabel) {
+        return
+    }
+
+    $needle = $searchBox.Text
+    if (-not $needle) {
+        $searchStatusLabel.Text = ""
+        return
+    }
+
+    $count = 0
+    foreach ($index in $script:RenderedLineIndexes) {
+        if ($script:DisplayLines[$index].IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $count++
+        }
+    }
+
+    if ($count -eq 0) {
+        $searchStatusLabel.Text = "0 matches"
+    } elseif ($script:CurrentSearchRenderedIndex -ge 0) {
+        $ordinal = 0
+        for ($i = 0; $i -lt $script:CurrentSearchRenderedIndex; $i++) {
+            $lineIndex = $script:RenderedLineIndexes[$i]
+            if ($script:DisplayLines[$lineIndex].IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $ordinal++
+            }
+        }
+        $searchStatusLabel.Text = "{0} of {1}" -f ($ordinal + 1), $count
+    } else {
+        $searchStatusLabel.Text = "{0} matches" -f $count
+    }
+}
+
+function Find-SearchText {
+    param([int]$Direction)
+
+    $needle = $searchBox.Text
+    if (-not $needle) {
+        Update-SearchStatus
+        return
+    }
+
+    if ($script:LastSearchText -ne $needle) {
+        $script:CurrentSearchRenderedIndex = -1
+        $script:LastSearchText = $needle
+    }
+
+    if ($script:RenderedLineIndexes.Count -eq 0) {
+        Render-Terminal -KeepSelection
+    }
+
+    $count = $script:RenderedLineIndexes.Count
+    if ($count -eq 0) {
+        Update-SearchStatus
+        return
+    }
+
+    if ($script:CurrentSearchRenderedIndex -lt 0) {
+        $start = if ($Direction -ge 0) { 0 } else { $count - 1 }
+    } else {
+        $start = ($script:CurrentSearchRenderedIndex + $Direction + $count) % $count
+    }
+
+    for ($attempt = 0; $attempt -lt $count; $attempt++) {
+        $renderedIndex = ($start + ($attempt * $Direction) + $count) % $count
+        $lineIndex = $script:RenderedLineIndexes[$renderedIndex]
+        $line = $script:DisplayLines[$lineIndex]
+        $matchOffset = $line.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($matchOffset -ge 0) {
+            $script:CurrentSearchRenderedIndex = $renderedIndex
+            $selectionStart = $script:RenderedLineOffsets[$renderedIndex] + $matchOffset
+            $terminal.Focus()
+            $terminal.SelectionStart = $selectionStart
+            $terminal.SelectionLength = $needle.Length
+            $terminal.ScrollToCaret()
+            Update-SearchStatus
+            return
+        }
+    }
+
+    $script:CurrentSearchRenderedIndex = -1
+    Update-SearchStatus
 }
 
 function Update-Status {
@@ -244,7 +526,7 @@ function Connect-Uart {
         foreach ($control in @($portBox, $baudBox, $dataBitsBox, $parityBox, $stopBitsBox, $handshakeBox, $dtrCheck, $rtsCheck)) {
             $control.Enabled = $false
         }
-        Add-Line ("Connected to {0} at {1}. Raw log: {2}" -f $settings.PortName, $settings.BaudRate, $script:LogPath)
+        Add-Line ("Connected to {0} at {1}. Log: {2}" -f $settings.PortName, $settings.BaudRate, $script:LogPath)
     } catch {
         if ($script:LogStream) {
             $script:LogStream.Dispose()
@@ -261,6 +543,8 @@ function Connect-Uart {
 }
 
 function Disconnect-Uart {
+    Flush-PendingLine
+
     if ($script:Serial) {
         try {
             if ($script:Serial.IsOpen) {
@@ -307,13 +591,18 @@ function Poll-Uart {
                     $buffer = $actual
                 }
 
-                $script:LogStream.Write($buffer, 0, $read)
-                $script:LogStream.Flush()
                 $script:ByteCount += $read
                 $readThisTick += $read
 
-                $terminal.AppendText((Format-BytesForDisplay -Bytes $buffer))
-                Trim-Terminal
+                if ($hexCheck.Checked) {
+                    $script:LogStream.Write($buffer, 0, $read)
+                    $terminal.AppendText((Format-BytesForDisplay -Bytes $buffer))
+                    Trim-TerminalText
+                } else {
+                    Add-ReceivedText -Text (Format-BytesForDisplay -Bytes $buffer)
+                }
+
+                $script:LogStream.Flush()
             }
 
             $available = $script:Serial.BytesToRead
@@ -339,7 +628,7 @@ $form.MinimumSize = New-Object System.Drawing.Size(980, 520)
 
 $topPanel = New-Object System.Windows.Forms.FlowLayoutPanel
 $topPanel.Dock = [System.Windows.Forms.DockStyle]::Top
-$topPanel.Height = 74
+$topPanel.Height = 112
 $topPanel.Padding = New-Object System.Windows.Forms.Padding(8, 8, 8, 4)
 $topPanel.WrapContents = $true
 $topPanel.AutoScroll = $true
@@ -465,6 +754,13 @@ $autoscrollCheck.Checked = $true
 $autoscrollCheck.Margin = New-Object System.Windows.Forms.Padding(4, 6, 4, 0)
 $topPanel.Controls.Add($autoscrollCheck)
 
+$cleanSpinnerCheck = New-Object System.Windows.Forms.CheckBox
+$cleanSpinnerCheck.Text = "Clean CR/spinner"
+$cleanSpinnerCheck.AutoSize = $true
+$cleanSpinnerCheck.Checked = $true
+$cleanSpinnerCheck.Margin = New-Object System.Windows.Forms.Padding(4, 6, 4, 0)
+$topPanel.Controls.Add($cleanSpinnerCheck)
+
 $connectButton = New-Object System.Windows.Forms.Button
 $connectButton.Text = "Connect"
 $connectButton.Width = 92
@@ -481,7 +777,7 @@ $topPanel.Controls.Add($connectButton)
 $clearButton = New-Object System.Windows.Forms.Button
 $clearButton.Text = "Clear"
 $clearButton.Width = 70
-$clearButton.Add_Click({ $terminal.Clear() })
+$clearButton.Add_Click({ Clear-TerminalBuffer })
 $topPanel.Controls.Add($clearButton)
 
 $openLogButton = New-Object System.Windows.Forms.Button
@@ -498,6 +794,69 @@ $openLogButton.Add_Click({
     Start-Process explorer.exe -ArgumentList "`"$logDir`""
 })
 $topPanel.Controls.Add($openLogButton)
+
+$filterLabel = New-Object System.Windows.Forms.Label
+$filterLabel.Text = "Filter"
+$filterLabel.AutoSize = $true
+$filterLabel.Margin = New-Object System.Windows.Forms.Padding(0, 10, 4, 0)
+$topPanel.Controls.Add($filterLabel)
+
+$filterBox = New-Object System.Windows.Forms.TextBox
+$filterBox.Width = 250
+$filterBox.Margin = New-Object System.Windows.Forms.Padding(0, 6, 4, 0)
+$filterBox.Add_TextChanged({
+    $script:CurrentSearchRenderedIndex = -1
+    Render-Terminal
+})
+$topPanel.Controls.Add($filterBox)
+
+$clearFilterButton = New-Object System.Windows.Forms.Button
+$clearFilterButton.Text = "Clear Filter"
+$clearFilterButton.Width = 86
+$clearFilterButton.Margin = New-Object System.Windows.Forms.Padding(0, 4, 12, 0)
+$clearFilterButton.Add_Click({ $filterBox.Clear() })
+$topPanel.Controls.Add($clearFilterButton)
+
+$searchLabel = New-Object System.Windows.Forms.Label
+$searchLabel.Text = "Search"
+$searchLabel.AutoSize = $true
+$searchLabel.Margin = New-Object System.Windows.Forms.Padding(0, 10, 4, 0)
+$topPanel.Controls.Add($searchLabel)
+
+$searchBox = New-Object System.Windows.Forms.TextBox
+$searchBox.Width = 250
+$searchBox.Margin = New-Object System.Windows.Forms.Padding(0, 6, 4, 0)
+$searchBox.Add_TextChanged({
+    $script:CurrentSearchRenderedIndex = -1
+    $script:LastSearchText = $searchBox.Text
+    Update-SearchStatus
+})
+$searchBox.Add_KeyDown({
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        Find-SearchText 1
+        $_.SuppressKeyPress = $true
+    }
+})
+$topPanel.Controls.Add($searchBox)
+
+$findPrevButton = New-Object System.Windows.Forms.Button
+$findPrevButton.Text = "Prev"
+$findPrevButton.Width = 54
+$findPrevButton.Margin = New-Object System.Windows.Forms.Padding(0, 4, 4, 0)
+$findPrevButton.Add_Click({ Find-SearchText -1 })
+$topPanel.Controls.Add($findPrevButton)
+
+$findNextButton = New-Object System.Windows.Forms.Button
+$findNextButton.Text = "Next"
+$findNextButton.Width = 54
+$findNextButton.Margin = New-Object System.Windows.Forms.Padding(0, 4, 4, 0)
+$findNextButton.Add_Click({ Find-SearchText 1 })
+$topPanel.Controls.Add($findNextButton)
+
+$searchStatusLabel = New-Object System.Windows.Forms.Label
+$searchStatusLabel.AutoSize = $true
+$searchStatusLabel.Margin = New-Object System.Windows.Forms.Padding(4, 10, 0, 0)
+$topPanel.Controls.Add($searchStatusLabel)
 
 $terminal = New-Object System.Windows.Forms.TextBox
 $terminal.Multiline = $true
