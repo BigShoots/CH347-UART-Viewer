@@ -39,6 +39,7 @@ Optional parameters:
 ```powershell
 .\CH347UartViewer.ps1 -DefaultPort COM3 -DefaultBaud 1500000 -AutoConnect
 .\CH347UartViewer.ps1 -LogDirectory C:\uart_logs
+.\CH347UartViewer.ps1 -DefaultDtr -DefaultRts -DefaultHex
 ```
 
 Only one application can normally open a COM port at a time. Close other terminals or loggers before connecting.

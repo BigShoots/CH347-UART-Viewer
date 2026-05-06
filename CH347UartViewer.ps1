@@ -2,6 +2,9 @@ param(
     [string]$DefaultPort = "",
     [int]$DefaultBaud = 115200,
     [string]$LogDirectory = "",
+    [switch]$DefaultDtr,
+    [switch]$DefaultRts,
+    [switch]$DefaultHex,
     [switch]$AutoConnect
 )
 
@@ -436,21 +439,21 @@ $topPanel.Controls.Add($handshakeBox)
 $dtrCheck = New-Object System.Windows.Forms.CheckBox
 $dtrCheck.Text = "DTR"
 $dtrCheck.AutoSize = $true
-$dtrCheck.Checked = $false
+$dtrCheck.Checked = [bool]$DefaultDtr
 $dtrCheck.Margin = New-Object System.Windows.Forms.Padding(12, 6, 4, 0)
 $topPanel.Controls.Add($dtrCheck)
 
 $rtsCheck = New-Object System.Windows.Forms.CheckBox
 $rtsCheck.Text = "RTS"
 $rtsCheck.AutoSize = $true
-$rtsCheck.Checked = $false
+$rtsCheck.Checked = [bool]$DefaultRts
 $rtsCheck.Margin = New-Object System.Windows.Forms.Padding(4, 6, 4, 0)
 $topPanel.Controls.Add($rtsCheck)
 
 $hexCheck = New-Object System.Windows.Forms.CheckBox
 $hexCheck.Text = "Hex"
 $hexCheck.AutoSize = $true
-$hexCheck.Checked = $false
+$hexCheck.Checked = [bool]$DefaultHex
 $hexCheck.Margin = New-Object System.Windows.Forms.Padding(12, 6, 4, 0)
 $topPanel.Controls.Add($hexCheck)
 
