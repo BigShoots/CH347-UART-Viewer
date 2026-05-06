@@ -21,6 +21,7 @@ $script:LogPath = $null
 $script:ByteCount = 0L
 $script:DisplayDecoder = New-Object System.Text.UTF8Encoding($false, $false)
 $script:MaxDisplayChars = 1048576
+$script:PollTimer = $null
 
 function Get-PortInventory {
     $ports = @{}
@@ -516,23 +517,25 @@ $statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 [void]$statusStrip.Items.Add($statusLabel)
 $form.Controls.Add($statusStrip)
 
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 50
-$timer.Add_Tick({ Poll-Uart })
+$script:PollTimer = New-Object System.Windows.Forms.Timer
+$script:PollTimer.Interval = 50
+$script:PollTimer.Add_Tick({ Poll-Uart })
 
 $form.Add_Shown({
     Refresh-Ports
     Add-Line "Ready. Select a COM port and serial settings, then connect."
     Add-Line "CH347 adapters appear as normal Windows COM ports when the WCH VCP driver is installed."
     Update-Status
-    $timer.Start()
+    $script:PollTimer.Start()
     if ($AutoConnect) {
         Connect-Uart
     }
 })
 
 $form.Add_FormClosing({
-    $timer.Stop()
+    if ($script:PollTimer) {
+        $script:PollTimer.Stop()
+    }
     Disconnect-Uart
 })
 
