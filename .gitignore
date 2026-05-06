@@ -1,0 +1,6 @@
+logs/
+*.log
+last_stdout.txt
+last_stderr.txt
+*.tmp
+*.bak
